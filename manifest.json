@@ -1,0 +1,17 @@
+{
+  "addons": [
+    {
+      "id": "remote-ssh",
+      "name": "Remote SSH",
+      "description": "Provides support for editing remote files and running remote terminal sessions inside Pragtical over an SSH tunnel.",
+      "version": "0.4.0",
+      "mod_version": "3.11.0",
+      "tags": [
+        "remote",
+        "ssh",
+        "terminal",
+        "files"
+      ]
+    }
+  ]
+}
