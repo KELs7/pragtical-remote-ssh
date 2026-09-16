@@ -173,7 +173,7 @@ function bridge.perform_sync_request(request)
 end
 
 -- Initiates our native connection pipeline directly within Lua
-function bridge.connect(ssh_host)
+function bridge.connect(ssh_host, target_dir)
   if bridge.client_socket then
     core.log("Remote is already active.")
     return true
@@ -338,6 +338,21 @@ function bridge.connect(ssh_host)
     core.error("Failed to verify remote working directory.")
     bridge.disconnect()
     return false
+  end
+
+  -- Switch to requested target directory if provided
+  if target_dir and target_dir ~= "" then
+    local cd_res = bridge.perform_sync_request({
+      action = "change_dir",
+      path = target_dir
+    })
+    if cd_res and cd_res.status == "ok" then
+      bridge.remote_cwd = cd_res.cwd
+      core.log("Remote Workspace: Changed working directory to " .. tostring(bridge.remote_cwd))
+    else
+      local msg = cd_res and cd_res.message or "Unknown error"
+      core.error("Failed to switch remote directory to %s: %s", tostring(target_dir), tostring(msg))
+    end
   end
 
   return true

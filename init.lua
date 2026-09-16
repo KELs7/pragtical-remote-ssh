@@ -179,6 +179,94 @@ local function get_ssh_hosts()
   return hosts
 end
 
+local function get_history_file()
+  local dir = USERDIR or os.getenv("HOME") or os.getenv("USERPROFILE") or "."
+  return dir .. "/remote_ssh_recents.txt"
+end
+
+local function load_recent_paths()
+  local file = io.open(get_history_file(), "r")
+  if not file then return {} end
+  local recents = {}
+  local seen = {}
+  for line in file:lines() do
+    line = line:match("^%s*(.-)%s*$")
+    if line ~= "" and not seen[line] then
+      seen[line] = true
+      table.insert(recents, line)
+    end
+  end
+  file:close()
+  return recents
+end
+
+local function save_recent_path(host, path)
+  if not host or not path or path == "" then return end
+  local norm = normalize_path(path)
+  local entry = host .. ":" .. norm
+  local recents = load_recent_paths()
+  local new_recents = { entry }
+  for _, item in ipairs(recents) do
+    if item ~= entry then
+      table.insert(new_recents, item)
+    end
+  end
+  while #new_recents > 50 do
+    table.remove(new_recents)
+  end
+  local file = io.open(get_history_file(), "w")
+  if file then
+    for _, item in ipairs(new_recents) do
+      file:write(item .. "\n")
+    end
+    file:close()
+  end
+end
+
+local function get_history_file()
+  local dir = USERDIR or os.getenv("HOME") or os.getenv("USERPROFILE") or "."
+  return dir .. "/remote_ssh_recents.txt"
+end
+
+local function load_recent_paths()
+  local file = io.open(get_history_file(), "r")
+  if not file then return {} end
+  local recents = {}
+  local seen = {}
+  for line in file:lines() do
+    line = line:match("^%s*(.-)%s*$")
+    if line ~= "" and not seen[line] then
+      seen[line] = true
+      table.insert(recents, line)
+    end
+  end
+  file:close()
+  return recents
+end
+
+local function save_recent_path(host, path)
+  if not host or not path or path == "" then return end
+  local norm = normalize_path(path)
+  local entry = host .. ":" .. norm
+  local recents = load_recent_paths()
+  local new_recents = { entry }
+  for _, item in ipairs(recents) do
+    if item ~= entry then
+      table.insert(new_recents, item)
+    end
+  end
+  while #new_recents > 50 do
+    table.remove(new_recents)
+  end
+  local file = io.open(get_history_file(), "w")
+  if file then
+    for _, item in ipairs(new_recents) do
+      file:write(item .. "\n")
+    end
+    file:close()
+  end
+end
+
 
 -- =====================================================================
 -- WORKSPACE API INTERCEPTS & REDIRECTIONS (CACHE AWARE)
@@ -504,13 +592,25 @@ end)
 
 command.add(nil, {
   -- Ctrl+Shift+P -> "Remote: Connect SSH"
-  ["remote:connect-ssh"] = function()
+["remote:connect-ssh"] = function()
     local hosts = get_ssh_hosts()
-    core.command_view:enter("Connect to SSH Host", {
-      submit = function(ssh_host)
-        if ssh_host and ssh_host ~= "" then
-          local success = bridge.connect(ssh_host)
+    local recents = load_recent_paths()
+    core.command_view:enter("Connect to SSH Host (host or host:path)", {
+      submit = function(input)
+        if input and input ~= "" then
+          local ssh_host, target_path = input:match("^([^:]+):%s*(.*)$")
+          if not ssh_host then
+            ssh_host = input
+            target_path = nil
+          elseif target_path == "" then
+            target_path = nil
+          end
+
+          local success = bridge.connect(ssh_host, target_path)
           if success then
+            if bridge.remote_cwd then
+              save_recent_path(ssh_host, bridge.remote_cwd)
+            end
             local treeview_plugin = package.loaded["plugins.treeview"]
             if treeview_plugin then
               treeview_plugin.cache = {}
@@ -521,11 +621,25 @@ command.add(nil, {
       end,
       suggest = function(text)
         local suggestions = {}
+        local seen = {}
+        local query = text:lower()
+
+        -- Priority 1: Saved host:path entries
+        for _, entry in ipairs(recents) do
+          if entry:lower():find(query, 1, true) and not seen[entry] then
+            seen[entry] = true
+            table.insert(suggestions, entry)
+          end
+        end
+
+        -- Priority 2: SSH config hosts
         for _, host in ipairs(hosts) do
-          if host:lower():find(text:lower(), 1, true) then
+          if host:lower():find(query, 1, true) and not seen[host] then
+            seen[host] = true
             table.insert(suggestions, host)
           end
         end
+
         return suggestions
       end
     })
@@ -549,6 +663,7 @@ command.add(nil, {
         if res and res.status == "ok" then
           bridge.remote_cwd = res.cwd
           core.log("Changed remote directory to: " .. bridge.remote_cwd)
+          save_recent_path(bridge.current_ssh_host, bridge.remote_cwd)
 
           list_dir_cache = {}
           file_info_cache = {}
