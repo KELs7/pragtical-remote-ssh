@@ -121,3 +121,9 @@ Restart Pragtical and use the command palette (`Ctrl+Shift+P` or `Cmd+Shift+P`) 
 1. Run the command: `Remote: Disconnect`
 2. Active remote document views will close, the SSH process will terminate, and the local workspace environment will reset.
 
+## Running test
+```sh
+PRAGTICAL_USERDIR=/tmp/pragtical_test_user /home/kels7/.local/bin/pragtical test tests/
+```
+Run from plugin root. First run: mkdir -p /tmp/pragtical_test_user (one-time, clean userdir so installed plugin won't load).
+
