@@ -510,6 +510,55 @@ test.describe("remote-ssh init", function()
         test.match(errors[1], "no such dir")
       end)
     end)
+
+    test.describe("remote:new-file", function()
+      test.it("is valid when connected and invalid when disconnected", function()
+        test.equal(command.is_valid("remote:new-file"), true)
+        bridge.disconnect()
+        test.equal(command.is_valid("remote:new-file"), false)
+      end)
+
+      test.it("creates a remote file and refreshes the treeview", function()
+        command.perform("remote:new-file")
+        test.match(captured.label, "New Remote File")
+        local sock = bridge.client_socket
+        local before = #sock.requests
+        -- root_view:open_doc is unavailable in headless test mode; no-op it
+        -- so the command's open-for-editing step doesn't corrupt the view tree.
+        local restore_opendoc = H.swap(core.root_view, "open_doc", function() end)
+        captured.submit("sub/newfile.txt")
+        restore_opendoc()
+        local save_req
+        for _, r in ipairs(sock.requests) do
+          if r.action == "save_file" then save_req = r end
+        end
+        test.not_nil(save_req)
+        test.equal(save_req.path, "sub/newfile.txt")
+        test.equal(save_req.content, "")
+        -- refresh: list_dir cache cleared so the sidebar re-queries
+        system.list_dir(proj .. "/sub")
+        test.equal(#sock.requests > before, true)
+      end)
+
+      test.it("reports failure when save_file fails", function()
+        bridge.client_socket = H.loopback({
+          handler = function(req) return { status = "error", message = "quota exceeded" } end
+        })
+        command.perform("remote:new-file")
+        local errors = {}
+        local restore = H.swap(core, "error", function(fmt, ...) table.insert(errors, string.format(fmt, ...)) end)
+        captured.submit("x.txt")
+        restore()
+        test.equal(#errors >= 1, true)
+        test.match(errors[1], "quota exceeded")
+      end)
+
+      test.it("suggests paths under the remote project", function()
+        command.perform("remote:new-file")
+        local sugg = captured.suggest("su")
+        test.equal(type(sugg), "table")
+      end)
+    end)
   end)
 
   test.describe("treeview / terminal hooks", function()
@@ -541,6 +590,231 @@ test.describe("remote-ssh init", function()
       -- pragtical 3.12 uses core.run_step; the plugin still installs a
       -- core.update wrapper that delegates to bridge.update when invoked.
       test.equal(type(core.update), "function")
+    end)
+  end)
+
+  test.describe("io.open intercept (remote file creation)", function()
+    test.it("creates a new remote file via the bridge on append mode", function()
+      local saved
+      bridge.client_socket = H.loopback({
+        handler = function(req)
+          if req.action == "file_info" then
+            return { status = "error", message = "not found" }
+          elseif req.action == "save_file" then
+            saved = req
+            return { status = "ok", action = "save_file" }
+          end
+          return default_handler(req)
+        end
+      })
+      local f, err = io.open(proj .. "/sub/new.txt", "a+")
+      test.not_nil(f)
+      test.is_nil(err)
+      test.not_nil(saved)
+      test.equal(saved.action, "save_file")
+      test.equal(saved.path, "sub/new.txt")
+      test.equal(saved.content, "")
+      test.equal(f:close(), true)
+    end)
+
+    test.it("does not truncate an existing remote file on append mode", function()
+      local save_called = false
+      bridge.client_socket = H.loopback({
+        handler = function(req)
+          if req.action == "file_info" then
+            return { status = "ok", type = "file", size = 10, modified = 1 }
+          elseif req.action == "save_file" then
+            save_called = true
+            return { status = "ok" }
+          end
+          return default_handler(req)
+        end
+      })
+      local f = io.open(proj .. "/sub/existing.txt", "a+")
+      test.not_nil(f)
+      test.equal(save_called, false)
+      f:close()
+    end)
+
+    test.it("creates + truncates on write mode", function()
+      local saved
+      bridge.client_socket = H.loopback({
+        handler = function(req)
+          if req.action == "save_file" then
+            saved = req
+            return { status = "ok" }
+          end
+          return default_handler(req)
+        end
+      })
+      local f = io.open(proj .. "/sub/w.txt", "w")
+      test.not_nil(f)
+      test.not_nil(saved)
+      test.equal(saved.path, "sub/w.txt")
+      f:close()
+    end)
+
+    test.it("refreshes caches so the new file appears in the treeview", function()
+      bridge.client_socket = H.loopback({
+        handler = function(req)
+          if req.action == "file_info" then
+            return { status = "error", message = "not found" }
+          end
+          return default_handler(req)
+        end
+      })
+      fake_treeview.cache = { stale = true }
+      system.list_dir(proj .. "/sub")          -- populate list_dir cache
+      local sock = bridge.client_socket
+      local before = #sock.requests
+      io.open(proj .. "/sub/new.txt", "a+"):close()
+      test.equal(next(fake_treeview.cache), nil)  -- treeview cache cleared
+      system.list_dir(proj .. "/sub")           -- re-fetch after refresh
+      test.equal(#sock.requests > before, true)  -- new list_dir request
+    end)
+
+    test.it("falls back to local io.open when disconnected", function()
+      bridge.disconnect()
+      core.projects = { make_project(proj) }
+      local f = io.open(proj .. PATHSEP .. "local.txt", "r")
+      test.not_nil(f)
+      test.equal(f:read("*a"), "hi")
+      f:close()
+    end)
+  end)
+
+  test.describe("remote:refresh command", function()
+    test.it("clears caches so subsequent listings re-hit the bridge", function()
+      system.list_dir(proj .. "/sub")
+      local sock = bridge.client_socket
+      local before = #sock.requests
+      command.perform("remote:refresh")
+      system.list_dir(proj .. "/sub")
+      test.equal(#sock.requests > before, true)
+      test.equal(next(fake_treeview.cache), nil)
+    end)
+
+    test.it("errors when not connected", function()
+      bridge.disconnect()
+      local errors = {}
+      local restore = H.swap(core, "error", function(fmt, ...) table.insert(errors, string.format(fmt, ...)) end)
+      command.perform("remote:refresh")
+      restore()
+      test.equal(#errors >= 1, true)
+      test.match(errors[1], "not connected")
+    end)
+  end)
+
+  test.describe("auto-refresh on leaving remote terminal", function()
+    local function fake_view()
+      return { supports_text_input = function() return false end, extends = function() return false end }
+    end
+    local saved_active_view
+    test.before_each(function() saved_active_view = core.active_view end)
+    test.after_each(function() core.active_view = saved_active_view end)
+
+    test.it("refreshes when switching away from a remote terminal view", function()
+      core.active_view = { is_remote_terminal = true }
+      system.list_dir(proj .. "/sub")
+      local sock = bridge.client_socket
+      local before = #sock.requests
+      core.set_active_view(fake_view())
+      system.list_dir(proj .. "/sub")
+      test.equal(#sock.requests > before, true)
+      test.equal(next(fake_treeview.cache), nil)
+    end)
+
+    test.it("does not refresh when switching from a non-terminal view", function()
+      core.active_view = fake_view()
+      system.list_dir(proj .. "/sub")
+      local sock = bridge.client_socket
+      local before = #sock.requests
+      core.set_active_view(fake_view())
+      system.list_dir(proj .. "/sub")
+      test.equal(#sock.requests, before)
+    end)
+
+    test.it("does not refresh when disconnected", function()
+      bridge.disconnect()
+      core.active_view = { is_remote_terminal = true }
+      test.no_error(function() core.set_active_view(fake_view()) end)
+      test.equal(bridge.is_connected(), false)
+    end)
+  end)
+
+  test.describe("auto-refresh while terminal is active", function()
+    local function fake_view()
+      return { supports_text_input = function() return false end, extends = function() return false end }
+    end
+    local saved_active_view
+    test.before_each(function() saved_active_view = core.active_view end)
+    test.after_each(function() core.active_view = saved_active_view end)
+
+    test.it("refreshes when a remote terminal is the active view", function()
+      -- the periodic refresh thread is the last add_thread captured
+      local refresh_fn = captured_threads[#captured_threads]
+      test.not_nil(refresh_fn)
+      core.active_view = { is_remote_terminal = true }
+      system.list_dir(proj .. "/sub")
+      local sock = bridge.client_socket
+      local before = #sock.requests
+      local co = coroutine.create(refresh_fn)
+      coroutine.resume(co)  -- advances to coroutine.yield(interval)
+      coroutine.resume(co)  -- runs the check + refresh
+      system.list_dir(proj .. "/sub")
+      test.equal(#sock.requests > before, true)
+    end)
+
+    test.it("skips refresh when the active view is not a remote terminal", function()
+      local refresh_fn = captured_threads[#captured_threads]
+      core.active_view = fake_view()
+      system.list_dir(proj .. "/sub")
+      local sock = bridge.client_socket
+      local before = #sock.requests
+      local co = coroutine.create(refresh_fn)
+      coroutine.resume(co)
+      coroutine.resume(co)
+      system.list_dir(proj .. "/sub")
+      test.equal(#sock.requests, before)
+    end)
+
+    test.it("skips refresh when disconnected", function()
+      local refresh_fn = captured_threads[#captured_threads]
+      bridge.disconnect()
+      core.active_view = { is_remote_terminal = true }
+      local co = coroutine.create(refresh_fn)
+      coroutine.resume(co)
+      test.no_error(function() coroutine.resume(co) end)
+      test.equal(bridge.is_connected(), false)
+    end)
+  end)
+
+  test.describe("tab title (DocView:get_name) consistency", function()
+    -- The plugin wraps DocView:get_name so every remote tab shows just the
+    -- basename (no host prefix), consistent regardless of whether the file
+    -- is at the remote root or inside a subdirectory.
+    local DocView = require("core.docview")
+
+    local function tab_title(abs)
+      local doc = Doc()
+      doc.is_remote_file = true
+      doc.abs_filename = abs
+      return DocView.get_name({ doc = doc })
+    end
+
+    test.it("root-level remote file shows only the basename", function()
+      test.equal(tab_title(proj .. "/test.txt"), "test.txt")
+    end)
+
+    test.it("subdir remote file shows only the basename", function()
+      test.equal(tab_title(proj .. "/sub/file.txt"), "file.txt")
+    end)
+
+    test.it("non-remote doc uses the original name", function()
+      local doc = Doc()
+      doc.filename = proj .. PATHSEP .. "local.txt"
+      doc.abs_filename = proj .. PATHSEP .. "local.txt"
+      test.equal(DocView.get_name({ doc = doc }), "local.txt")
     end)
   end)
 end)
