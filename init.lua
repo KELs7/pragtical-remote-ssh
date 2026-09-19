@@ -3,6 +3,7 @@
 
 local core = require "core"
 local command = require "core.command"
+local common = require "core.common"
 local Doc = require "core.doc"
 local Project = require "core.project"
 local DirWatch = require "core.dirwatch"
@@ -146,6 +147,20 @@ local function invalidate_cache(path)
   if parent then
     list_dir_cache[parent] = nil
   end
+end
+
+-- Clears every remote filesystem cache and the TreeView sidebar cache so the
+-- next access re-queries the remote host. Used after remote mutations (new
+-- file creation) and by the `remote:refresh` command so the sidebar reflects
+-- changes made outside of the editor (e.g. files created in the SSH terminal).
+local function refresh_remote()
+  list_dir_cache = {}
+  file_info_cache = {}
+  local treeview_plugin = package.loaded["plugins.treeview"]
+  if treeview_plugin then
+    treeview_plugin.cache = {}
+  end
+  core.redraw = true
 end
 
 -- Parses user ~/.ssh/config purely for Host alias suggestions
@@ -425,6 +440,56 @@ function Doc:save(filename)
   return original_doc_save(self, filename)
 end
 
+-- Intercept io.open so the TreeView "New File" command creates the file on the
+-- remote host through the bridge instead of attempting a local disk write
+-- (which would fail because the remote project path does not exist locally).
+-- Only write/create modes (w, a, +, x) on remote paths are routed; read modes
+-- fall back to the original io.open. A lightweight file handle whose close()
+-- succeeds is returned, which is all treeview:new-file uses.
+local original_io_open = io.open
+io.open = function(filename, mode)
+  local norm = normalize_path(filename)
+  if bridge.is_connected() and is_path_remote(norm) then
+    local m = mode or "r"
+    if m:match("[wax]") then
+      local remote_path = get_remote_path(norm)
+      -- append modes must not truncate an existing file
+      if m:match("a") then
+        local info = bridge.perform_sync_request({ action = "file_info", path = remote_path })
+        if not (info and info.status == "ok") then
+          local res = bridge.perform_sync_request({ action = "save_file", path = remote_path, content = "" })
+          if not (res and res.status == "ok") then
+            return nil, "Remote file creation failed"
+          end
+        end
+      else
+        local res = bridge.perform_sync_request({ action = "save_file", path = remote_path, content = "" })
+        if not (res and res.status == "ok") then
+          return nil, "Remote file creation failed"
+        end
+      end
+      refresh_remote()
+      return { close = function() return true end }
+    end
+    return original_io_open(filename, mode)
+  end
+  return original_io_open(filename, mode)
+end
+
+-- Refresh the sidebar when focus leaves a remote terminal view. Files created
+-- inside the SSH terminal (e.g. `touch new.txt`) would otherwise stay hidden
+-- behind the list_dir TTL cache until it expires, since DirWatch polling is
+-- suppressed on remote sessions. The remote terminals are tagged with
+-- `is_remote_terminal` by the TerminalView:spawn override above.
+local original_set_active_view = core.set_active_view
+function core.set_active_view(view)
+  local prev = core.active_view
+  original_set_active_view(view)
+  if bridge.is_connected() and prev and prev ~= view and prev.is_remote_terminal then
+    refresh_remote()
+  end
+end
+
 -- Extend Pragtical's update loop
 local core_update = core.update
 function core.update()
@@ -483,6 +548,24 @@ function Doc:get_name()
     return "[" .. (bridge.current_ssh_host or "Remote") .. "] " .. remote_path
   end
   return original_doc_get_name(self)
+end
+
+-- Override the tab title so every remote tab shows just the basename, with no
+-- host prefix. The default DocView:get_name() extracts the basename after the
+-- last '/' from Doc:get_name(), which keeps the "[host]" prefix only when the
+-- remote path has no slash (root files) and drops it for subdir files -- an
+-- inconsistency. Returning the basename directly here makes all remote tabs
+-- uniform.
+local DocView = require "core.docview"
+local original_docview_get_name = DocView.get_name
+function DocView:get_name()
+  if bridge.is_connected() and self.doc and self.doc.is_remote_file
+    and self.doc.abs_filename then
+    local post = self.doc:is_dirty() and "*" or ""
+    local remote_path = get_remote_path(self.doc.abs_filename)
+    return remote_path:match("[^/%\\]*$") .. post
+  end
+  return original_docview_get_name(self)
 end
 
 -- Intercept standard and quiet logging to scrub absolute local paths
@@ -730,5 +813,69 @@ command.add(nil, {
     else
       core.log("Remote Bridge is not connected.")
     end
+  end,
+
+  ["remote:refresh"] = function()
+    if not bridge.is_connected() then
+      core.error("Remote is not connected.")
+      return
+    end
+    refresh_remote()
+    core.log("Refreshed remote workspace.")
   end
 })
+
+-- Create a new file on the remote host. This command is always available
+-- in the command palette while a remote session is active, unlike
+-- treeview:new-file which only appears when a sidebar item is selected.
+-- After saving the empty file it is opened for editing and the sidebar is
+-- refreshed so the new entry shows up immediately.
+command.add(bridge.is_connected, {
+  ["remote:new-file"] = function()
+    local project_path = core.projects[1] and core.projects[1].path or ""
+    core.command_view:enter("New Remote File", {
+      submit = function(filename)
+        if not filename or filename == "" then return end
+        local norm = normalize_path(project_path .. PATHSEP .. filename)
+        local remote_path = get_remote_path(norm)
+        local res = bridge.perform_sync_request({
+          action = "save_file",
+          path = remote_path,
+          content = ""
+        })
+        if res and res.status == "ok" then
+          refresh_remote()
+          core.log("Created remote file: [%s] %s",
+            bridge.current_ssh_host or "Remote", remote_path)
+          local doc = core.open_doc(norm)
+          if doc then
+            pcall(core.root_view.open_doc, core.root_view, doc)
+          end
+        else
+          core.error("Failed to create remote file: %s",
+            res and res.message or "unknown error")
+        end
+      end,
+      suggest = function(text)
+        return common.path_suggest(text, project_path)
+      end
+    })
+  end
+})
+
+-- Periodically refresh the sidebar while a remote terminal is the active view,
+-- so files created in the SSH terminal (e.g. `touch new.txt`) appear in the
+-- treeview without manually running remote:refresh or waiting for the
+-- list_dir TTL cache to expire. The interval is a compromise between
+-- responsiveness and remote network traffic; only runs while a remote
+-- terminal is focused.
+local REFRESH_INTERVAL = 3.0
+core.add_thread(function()
+  while true do
+    coroutine.yield(REFRESH_INTERVAL)
+    if bridge.is_connected()
+      and core.active_view and core.active_view.is_remote_terminal then
+      refresh_remote()
+    end
+  end
+end)
