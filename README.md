@@ -40,6 +40,10 @@ The architecture consists of two main parts:
 * **Integrated Terminal Routing:** Automatically overrides local terminal initialization to launch an SSH shell session positioned inside your active remote working directory.
 * **Polling Suppressions:** Disables background file-watching (`DirWatch`) and recursive workspace polling (`Project:files`) on remote workspaces to prevent excessive CPU and network consumption.
 * **SSH Config Suggestions:** Parses your local `~/.ssh/config` file to provide auto-completion suggestions when entering a host.
+* **Remote New File Creation:** The `Remote: New File` command creates a new file on the remote host directly from the command palette (always available while connected), creates it through the bridge, refreshes the sidebar, and opens it for editing. The Treeview's built-in `New File` action is also routed through the bridge so it works on remote paths.
+* **Workspace Refresh:** The `Remote: Refresh` command clears the directory/metadata caches and the Treeview sidebar cache so the sidebar re-queries the remote host — useful after files are created or modified outside the editor.
+* **Auto-Refresh Around the Terminal:** Since background polling is suppressed, the sidebar automatically refreshes when focus leaves a remote terminal view and periodically (every few seconds) while a remote terminal is the active view, so files created in the SSH terminal appear without a manual refresh.
+* **Consistent Tab Titles:** Remote document tabs show just the file's basename (e.g. `file.txt`), uniformly whether the file lives at the remote root or inside a subdirectory.
 
 ---
 
@@ -116,6 +120,19 @@ Restart Pragtical and use the command palette (`Ctrl+Shift+P` or `Cmd+Shift+P`) 
 1. Run the command: `Remote: Change Directory`
 2. Input the absolute path of the remote directory you want to open.
 3. The workspace sidebar (Treeview) and status bar will refresh to reflect your remote folder structure.
+
+### Creating a New File
+1. Run the command: `Remote: New File` (available in the palette only while a remote session is active).
+2. Enter the filename relative to the remote working directory (e.g. `notes.txt` or `src/main.lua`). Path autocompletion is offered from the remote listing.
+3. The file is created on the remote host, the sidebar is refreshed so it appears immediately, and the file is opened in a new tab.
+
+> The Treeview context-menu **New File** action also works on remote paths: it is routed through the bridge rather than attempting a local disk write. The remote working directory must be writable by the SSH user (a `cannot open` error indicates a server-side permission issue — run `Remote: Change Directory` to a writable directory).
+
+### Refreshing the Workspace
+1. Run the command: `Remote: Refresh`.
+2. The remote directory/metadata caches and the Treeview sidebar cache are cleared; the sidebar re-queries the remote host on its next draw.
+
+> You normally don't need this: the sidebar auto-refreshes when focus leaves a remote terminal and every few seconds while a remote terminal is the active view. Use it manually after making changes on the remote host through some other channel.
 
 ### Disconnecting
 1. Run the command: `Remote: Disconnect`
