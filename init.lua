@@ -860,6 +860,72 @@ command.add(bridge.is_connected, {
         return common.path_suggest(text, project_path)
       end
     })
+  end,
+
+  -- Create a new directory on the remote host. Like remote:new-file this
+  -- is registered with the connection predicate so it is listed in the
+  -- palette whenever a remote session is active, regardless of focus.
+  -- After creating the directory the caches are refreshed so the sidebar
+  -- shows the new entry immediately.
+  ["remote:new-directory"] = function()
+    local project_path = core.projects[1] and core.projects[1].path or ""
+    core.command_view:enter("New Remote Directory", {
+      submit = function(dirname)
+        if not dirname or dirname == "" then return end
+        local norm = normalize_path(project_path .. PATHSEP .. dirname)
+        local remote_path = get_remote_path(norm)
+        local res = bridge.perform_sync_request({
+          action = "make_dir",
+          path = remote_path
+        })
+        if res and res.status == "ok" then
+          refresh_remote()
+          core.log("Created remote directory: [%s] %s",
+            bridge.current_ssh_host or "Remote", remote_path)
+        else
+          core.error("Failed to create remote directory: %s",
+            res and res.message or "unknown error")
+        end
+      end,
+      suggest = function(text)
+        -- Suggest directories relative to the project root (with a trailing
+        -- separator) so a picked suggestion can be submitted as-is.
+        local parent_dir, partial = text:match("^(.-)([^/\\]*)$")
+        local is_absolute = parent_dir:match("^/") or parent_dir:match("^%a:")
+        local query_path
+        if is_absolute then
+          query_path = parent_dir
+        else
+          local project = core.projects[1] and core.projects[1].path or ""
+          if parent_dir ~= "" then
+            local clean_parent = parent_dir:gsub("[/\\]", PATHSEP)
+            if clean_parent:sub(-1) == PATHSEP then
+              clean_parent = clean_parent:sub(1, -2)
+            end
+            query_path = project .. PATHSEP .. clean_parent
+          else
+            query_path = project
+          end
+        end
+        local items = system.list_dir(query_path) or {}
+        local suggestions = {}
+        for _, item in ipairs(items) do
+          local full_local_path = query_path
+          if full_local_path:sub(-1) ~= PATHSEP then
+            full_local_path = full_local_path .. PATHSEP
+          end
+          full_local_path = full_local_path .. item
+          local info = system.get_file_info(full_local_path)
+          if info and info.type == "dir" then
+            local rel_item_path = parent_dir .. item
+            if rel_item_path:lower():find(text:lower(), 1, true) == 1 then
+              table.insert(suggestions, rel_item_path .. PATHSEP)
+            end
+          end
+        end
+        return suggestions
+      end
+    })
   end
 })
 

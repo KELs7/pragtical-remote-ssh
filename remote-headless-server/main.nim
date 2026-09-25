@@ -116,6 +116,26 @@ proc handleRequest(clientSocket: AsyncSocket, req: JsonNode) {.async.} =
         "message": e.msg
       })
 
+  of "make_dir":
+    let path = req.getOrDefault("path").getStr()
+    echo "[Server] Make directory request: ", path
+    try:
+      createDir(path)
+      await clientSocket.sendFramedMessage(%* {
+        "status": "ok",
+        "action": "make_dir",
+        "id": reqId,
+        "path": path
+      })
+    except CatchableError as e:
+      echo "[Server] make_dir failed: ", path, " | Error: ", e.msg
+      await clientSocket.sendFramedMessage(%* {
+        "status": "error",
+        "action": "make_dir",
+        "id": reqId,
+        "message": "Directory creation failed: " & e.msg
+      })
+
   of "spawn":
     let cmd = req.getOrDefault("cmd").getStr()
     let procId = req.getOrDefault("id").getStr()
