@@ -29,7 +29,11 @@ background coroutine, prints results, and quits with exit code `0` on success
 |                  | `disconnect()`, and `connect()` (mocked ssh/net) tests.      |
 | `init.lua`       | API intercepts (`system.*`, `Doc:*`, `DirWatch`, `Project`), |
 |                  | path scrubbing, view/title, on_disconnect, commands, and    |
-|                  | treeview/terminal hook installation tests.                   |
+|                  | treeview/terminal hook installation tests.                  |
+| `new_directory.lua` | contract tests for the `remote:new-directory` command.   |
+| `benchmarks.lua` | standalone benchmarks for `bridge.lua` efficiency; run      |
+|                  | explicitly for before/after numbers (~0.5 s, does not       |
+|                  | meaningfully slow the suite when picked up by `tests/`).    |
 
 ## Notes
 

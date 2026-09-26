@@ -13,13 +13,22 @@ local bridge = {
   on_disconnect = nil
 }
 
--- Network framing state machine variables
-local rx_buffer = ""
+-- Network framing state machine variables. Incoming bytes are kept as a
+-- list of chunks with a head index instead of one concatenated string:
+-- appending a chunk is O(1) and each payload is copied exactly once when
+-- it is complete (a plain `rx_buffer = rx_buffer .. chunk` re-copies the
+-- whole buffer per chunk, which is O(N^2) on large transfers).
+local pending = {}
+local pending_head = 1
+local pending_tail = 0
+local pending_len = 0
+local head_offset = 0
 local state = "LENGTH"
 local expected_bytes = 4
 
 local pending_responses = {}
 local async_event_queue = {}
+local last_stderr_check = 0
 
 -- Helper to safely terminate background processes
 local function stop_process(proc)
@@ -35,58 +44,124 @@ end
 local function check_ssh_agent()
   local proc, err = process.start({"ssh-add", "-l"})
   if not proc then return 2 end
+  -- Guard against a hung ssh-agent (blocked agent, odd environments):
+  -- without this the connect loop below would spin forever.
+  local start_time = system.get_time()
   while proc:running() do
+    if system.get_time() - start_time > 5.0 then
+      stop_process(proc)
+      return 2
+    end
     system.sleep(0.005)
   end
   local code = proc:returncode()
   return code or 2
 end
 
--- Parses chunk streams through the framing state machine
-local function process_socket_stream(chunk)
-  rx_buffer = rx_buffer .. chunk
-  local processing = true
-
-  while processing do
-    if #rx_buffer >= expected_bytes then
-      if state == "LENGTH" then
-        local len = string.unpack(">I4", rx_buffer:sub(1, 4))
-        rx_buffer = rx_buffer:sub(5)
-        expected_bytes = len
-        state = "PAYLOAD"
-      elseif state == "PAYLOAD" then
-        local payload = rx_buffer:sub(1, expected_bytes)
-        rx_buffer = rx_buffer:sub(expected_bytes + 1)
-        
-        local ok, data = pcall(mp.unpack, payload)
-        if ok and type(data) == "table" then
-          if data.id then
-            pending_responses[tostring(data.id)] = data
-          else
-            table.insert(async_event_queue, data)
-          end
-        else
-          local err_msg = not ok and tostring(data) or "invalid MessagePack object received"
-          core.error("[%s] MessagePack decode error: %s", bridge.current_ssh_host or "Remote", tostring(err_msg))
-        end
-        
-        expected_bytes = 4
-        state = "LENGTH"
+-- Removes and returns exactly `n` bytes from the front of the chunk list.
+-- Only the requested bytes are copied; the unconsumed remainder of a
+-- partially-taken chunk is kept in place via `head_offset`, so a burst of
+-- many messages inside one chunk costs one payload copy per message
+-- instead of re-slicing the whole remainder (O(N^2)).
+local function take_bytes(n)
+  local parts = {}
+  local need = n
+  while need > 0 do
+    local c = pending[pending_head]
+    local avail_in_c = #c - head_offset
+    if avail_in_c <= need then
+      if head_offset == 0 then
+        parts[#parts + 1] = c
+      else
+        parts[#parts + 1] = c:sub(head_offset + 1)
       end
+      need = need - avail_in_c
+      pending[pending_head] = nil
+      pending_head = pending_head + 1
+      head_offset = 0
     else
-      processing = false
+      parts[#parts + 1] = c:sub(head_offset + 1, head_offset + need)
+      head_offset = head_offset + need
+      need = 0
     end
+  end
+  pending_len = pending_len - n
+  if #parts == 1 then return parts[1] end
+  return table.concat(parts)
+end
+
+-- Parses chunk streams through the framing state machine. Each payload is
+-- copied exactly once when complete, so a burst of N messages in one chunk
+-- stays O(N) instead of degrading to O(N^2) byte copying.
+local function process_socket_stream(chunk)
+  pending_tail = pending_tail + 1
+  pending[pending_tail] = chunk
+  pending_len = pending_len + #chunk
+
+  while pending_len >= expected_bytes do
+    if state == "LENGTH" then
+      local len = string.unpack(">I4", take_bytes(4))
+      expected_bytes = len
+      state = "PAYLOAD"
+    elseif state == "PAYLOAD" then
+      local payload = take_bytes(expected_bytes)
+
+      local ok, data = pcall(mp.unpack, payload)
+      if ok and type(data) == "table" then
+        if data.id then
+          pending_responses[tostring(data.id)] = data
+        else
+          table.insert(async_event_queue, data)
+        end
+      else
+        local err_msg = not ok and tostring(data) or "invalid MessagePack object received"
+        core.error("[%s] MessagePack decode error: %s", bridge.current_ssh_host or "Remote", tostring(err_msg))
+      end
+
+      expected_bytes = 4
+      state = "LENGTH"
+    end
+  end
+
+  -- Periodically drop the consumed head slots so the chunk list does not
+  -- grow unbounded across a session.
+  if pending_head > 512 then
+    local j = 1
+    local first = pending[pending_head]
+    if head_offset > 0 and head_offset < #first then
+      pending[1] = first:sub(head_offset + 1)
+      j = 2
+    end
+    pending[pending_head] = nil
+    for i = pending_head + 1, pending_tail do
+      pending[j] = pending[i]
+      pending[i] = nil
+      j = j + 1
+    end
+    pending_tail = j - 1
+    pending_head = 1
+    head_offset = 0
   end
 end
 
--- Encodes and transmits a command with a 4-byte network byte-order header
+-- Encodes and transmits a command with a 4-byte network byte-order header.
+-- Header and payload are written separately to avoid copying the whole
+-- payload a second time on large saves (TCP is a byte stream, so the
+-- framing state machine reassembles both orders identically).
 local function send_remote_command(payload_table)
   if not bridge.client_socket then return false end
   local bin_data = mp.pack(payload_table)
   local length = #bin_data
   local header = string.pack(">I4", length)
 
-  local written, err = bridge.client_socket:write(header .. bin_data)
+  local written, err = bridge.client_socket:write(header)
+  if not written then
+    core.error("[%s] Socket write error: %s", bridge.current_ssh_host or "Remote", tostring(err))
+    bridge.disconnect()
+    return false
+  end
+
+  written, err = bridge.client_socket:write(bin_data)
   if not written then
     core.error("[%s] Socket write error: %s", bridge.current_ssh_host or "Remote", tostring(err))
     bridge.disconnect()
@@ -115,7 +190,11 @@ function bridge.disconnect()
   bridge.remote_cwd = nil
 
   -- Reset network parsing state
-  rx_buffer = ""
+  pending = {}
+  pending_head = 1
+  pending_tail = 0
+  pending_len = 0
+  head_offset = 0
   state = "LENGTH"
   expected_bytes = 4
   pending_responses = {}
@@ -157,13 +236,17 @@ function bridge.perform_sync_request(request)
     if chunk and chunk ~= "" then
       process_socket_stream(chunk)
     end
-    
+
     if not pending_responses[request_id] then
       if system.get_time() - start_time > timeout then
         core.error("[%s Sync] Request timed out for action: %s", bridge.current_ssh_host or "Remote", tostring(request.action))
         break
       end
-      system.sleep(0.001)
+      -- Only sleep when no data arrived; sleeping while chunks are still
+      -- streaming adds ~1 ms per read (over a second on a multi-MB file).
+      if not chunk or chunk == "" then
+        system.sleep(0.001)
+      end
     end
   end
   
@@ -376,11 +459,17 @@ function bridge.update()
     end
   end
 
-  -- Handle SSH channel errors
+  -- Handle SSH channel errors. Throttled to at most one pipe read per
+  -- second: update() runs at frame rate for the whole session, and reading
+  -- a near-idle stderr stream every frame is millions of wasted syscalls.
   if bridge.ssh_proc then
-    local err_output = bridge.ssh_proc:read_stderr(4096)
-    if err_output and err_output ~= "" then
-      core.error("[Bridge Error] %s", err_output:gsub("[\r\n]+", " "))
+    local now = system.get_time()
+    if now - last_stderr_check > 1.0 then
+      last_stderr_check = now
+      local err_output = bridge.ssh_proc:read_stderr(4096)
+      if err_output and err_output ~= "" then
+        core.error("[Bridge Error] %s", err_output:gsub("[\r\n]+", " "))
+      end
     end
   end
 

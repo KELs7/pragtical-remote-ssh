@@ -95,6 +95,7 @@ function H.loopback(opts)
   sock.written = ""
   sock.requests = {}
   local read_buf = ""
+  local write_acc = ""
   local function feed(data)
     read_buf = read_buf .. data
   end
@@ -112,21 +113,24 @@ function H.loopback(opts)
   end
   function sock:write(data)
     sock.written = sock.written .. data
-    if #data >= 4 then
-      local len = string.unpack(">I4", data:sub(1, 4))
-      if #data >= 4 + len then
-        local payload = data:sub(5, 4 + len)
-        local ok, req = pcall(mp.unpack, payload)
-        if ok then
-          table.insert(sock.requests, req)
-          local resp = opts.handler(req)
-          if type(resp) == "string" then
-            feed(resp)
-          elseif is_message(resp) then
-            emit(resp, req)
-          elseif type(resp) == "table" then
-            for _, item in ipairs(resp) do emit(item, req) end
-          end
+    -- Accumulate writes: the bridge may send header and payload separately,
+    -- so parse complete frames from the accumulated stream.
+    write_acc = write_acc .. data
+    while #write_acc >= 4 do
+      local len = string.unpack(">I4", write_acc:sub(1, 4))
+      if #write_acc < 4 + len then break end
+      local payload = write_acc:sub(5, 4 + len)
+      write_acc = write_acc:sub(4 + len + 1)
+      local ok, req = pcall(mp.unpack, payload)
+      if ok and req then
+        table.insert(sock.requests, req)
+        local resp = opts.handler(req)
+        if type(resp) == "string" then
+          feed(resp)
+        elseif is_message(resp) then
+          emit(resp, req)
+        elseif type(resp) == "table" then
+          for _, item in ipairs(resp) do emit(item, req) end
         end
       end
     end
