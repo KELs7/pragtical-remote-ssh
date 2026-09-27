@@ -1,8 +1,9 @@
 # server/src/process_manager.nim
 {.push hint[ConvFromXtoItselfNotNeeded]: off.}
 
-import std/[osproc, streams, os, json, asyncnet, nativesockets]
-import msgpack4nim/msgpack2json
+import std/[osproc, streams, os, nativesockets, asyncnet]
+import msgpack4nim/msgpack2any
+import protocol
 
 when defined(windows):
   import std/winlean
@@ -29,12 +30,12 @@ proc rawSendAll(fd: SocketHandle, buf: pointer, size: int): bool =
 type
   # We define ThreadArgs with primitive systems types to bypass GC reference count tracking
   ThreadArgs = tuple[
-    processPtr: pointer, 
-    socketFd: SocketHandle, 
+    processPtr: pointer,
+    socketFd: SocketHandle,
     id: string
   ]
 
-  # ProcessContext is now a heap-allocated ref object. This guarantees 
+  # ProcessContext is now a heap-allocated ref object. This guarantees
   # its memory address and running thread handle remain stable.
   ProcessContext* = ref object
     id*: string
@@ -44,6 +45,27 @@ type
 # Define a global table to keep track of running processes on the server
 var activeProcesses* = newSeq[ProcessContext]()
 
+# Frames and transmits one process_output event over the raw socket fd.
+proc sendOutputEvent(socketFd: SocketHandle, id: string, chunk: string): bool =
+  let eventPayload = mkMap({
+    "event": anyString("process_output"),
+    "id": anyString(id),
+    "data": anyString(chunk)
+  })
+
+  try:
+    let mpData = fromAny(eventPayload)
+    var netLength = nativesockets.htonl(mpData.len.uint32)
+
+    var message = newString(4 + mpData.len)
+    copyMem(addr message[0], addr netLength, 4)
+    if mpData.len > 0:
+      copyMem(addr message[4], addr mpData[0], mpData.len)
+
+    return rawSendAll(socketFd, addr message[0], message.len)
+  except CatchableError:
+    return false # Socket closed by parent main thread
+
 # This procedure executes on an independent background thread.
 proc processStreamReader(args: ThreadArgs) {.thread.} =
   # Safely cast the raw pointer back to Process without triggering RC updates
@@ -51,87 +73,44 @@ proc processStreamReader(args: ThreadArgs) {.thread.} =
   let socketFd = args.socketFd
   let id = args.id
   let outputStream = p.outputStream
-  
+
   # Allocate a reuseable buffer for chunked reading (4KB is optimal for pipe transport)
   var buffer = newString(4096)
-  
-  # 1. Main stream processing loop (runs while the process is active)
-  while p.running:
-    if outputStream.atEnd():
-      sleep(5)
-      continue
-    
-    # Read chunked raw data from the output stream
-    let bytesRead = outputStream.readData(addr buffer[0], 4096)
-    if bytesRead > 0:
-      let chunk = buffer[0 ..< bytesRead]
-      let eventPayload = %* {
-        "event": "process_output",
-        "id": id,
-        "data": chunk
-      }
-      
-      try:
-        let mpData = fromJsonNode(eventPayload)
-        var netLength = nativesockets.htonl(mpData.len.uint32)
-        
-        # Consolidate the length header and MessagePack data into a single contiguous block
-        var message = newString(4 + mpData.len)
-        copyMem(addr message[0], addr netLength, 4)
-        if mpData.len > 0:
-          copyMem(addr message[4], addr mpData[0], mpData.len)
-          
-        if not rawSendAll(socketFd, addr message[0], message.len): break
-      except CatchableError:
-        break # Socket closed by parent main thread
-        
-  # 2. Post-exit drain loop (ensures no final stdout chunks are truncated on process exit)
-  while not outputStream.atEnd():
+
+  # Blocking read loop: waits for data or EOF (the pipe's write end closes
+  # when the process exits), so output is forwarded immediately with no
+  # 5 ms polling delay and no ~200 wakeups/s while the terminal is idle.
+  # Doubles as the post-exit drain loop -- no final stdout chunks are
+  # truncated on process exit.
+  while true:
     let bytesRead = outputStream.readData(addr buffer[0], 4096)
     if bytesRead <= 0:
-      break
-    
-    let chunk = buffer[0 ..< bytesRead]
-    let eventPayload = %* {
-      "event": "process_output",
-      "id": id,
-      "data": chunk
-    }
-    
-    try:
-      let mpData = fromJsonNode(eventPayload)
-      var netLength = nativesockets.htonl(mpData.len.uint32)
-      
-      var message = newString(4 + mpData.len)
-      copyMem(addr message[0], addr netLength, 4)
-      if mpData.len > 0:
-        copyMem(addr message[4], addr mpData[0], mpData.len)
-        
-      if not rawSendAll(socketFd, addr message[0], message.len): break
-    except CatchableError:
+      break # EOF: process (and all children holding the pipe) exited
+
+    if not sendOutputEvent(socketFd, id, buffer[0 ..< bytesRead]):
       break
 
-  # Thread exits once process is fully dead and pipe is drained, notifying the client
+  # Thread exits once the pipe is drained, notifying the client
   let exitCode = p.peekExitCode()
-  let exitPayload = %* {
-    "event": "process_exit",
-    "id": id,
-    "exitCode": exitCode
-  }
-  
+  let exitPayload = mkMap({
+    "event": anyString("process_exit"),
+    "id": anyString(id),
+    "exitCode": anyInt(exitCode.int64)
+  })
+
   try:
-    let mpData = fromJsonNode(exitPayload)
+    let mpData = fromAny(exitPayload)
     var netLength = nativesockets.htonl(mpData.len.uint32)
-    
+
     var message = newString(4 + mpData.len)
     copyMem(addr message[0], addr netLength, 4)
     if mpData.len > 0:
       copyMem(addr message[4], addr mpData[0], mpData.len)
-      
+
     discard rawSendAll(socketFd, addr message[0], message.len)
   except CatchableError:
     discard
-    
+
   p.close()
 
 proc spawnProcessAsync*(socket: AsyncSocket, cmd: string, workDir: string, procId: string): bool =
@@ -139,25 +118,25 @@ proc spawnProcessAsync*(socket: AsyncSocket, cmd: string, workDir: string, procI
   try:
     # Start process with combined standard error and stdout pipelines
     let p = startProcess(
-      cmd, 
-      workDir, 
+      cmd,
+      workDir,
       options = {poStdErrToStdOut, poUsePath, poEvalCommand}
     )
-    
+
     # Allocate our context directly on the heap
     let context = ProcessContext(id: procId, process: p)
-    
+
     # Extract raw primitives to safely cross the thread boundary
     let processPtr = cast[pointer](p)
     let socketFd = socket.getFd()
-    
+
     # Spawn the background thread using context.readerThread's stable address
     createThread(
-      context.readerThread, 
-      processStreamReader, 
+      context.readerThread,
+      processStreamReader,
       (processPtr, socketFd, procId)
     )
-    
+
     activeProcesses.add(context)
     return true
   except CatchableError as e:
