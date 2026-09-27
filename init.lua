@@ -48,6 +48,8 @@ local function get_normalized_project_paths()
 end
 
 -- Setup the disconnection hook to handle local workspace and editor UI resets
+local clear_treeview_cache  -- forward declaration; defined below near refresh_remote
+local clear_treeview_remote_state  -- forward declaration; defined below
 bridge.on_disconnect = function()
   file_info_cache = {}
   list_dir_cache = {}
@@ -64,7 +66,12 @@ bridge.on_disconnect = function()
   for _, view in ipairs(views_to_close) do
     local node = core.root_view.root_node:get_node_for_view(view)
     if node then
-      node:close_view(core.root_view, view)
+      -- remove_view walks the node tree via root.a/root.b, so it needs a
+      -- Node (root_node), not the RootView object (passing the latter
+      -- errors with 'attempt to index local root (a nil value)' when the
+      -- doc is alone in its leaf node). pcall so one failing close cannot
+      -- skip the cache resets and redraw below.
+      pcall(node.close_view, node, core.root_view.root_node, view)
     end
   end
 
@@ -93,12 +100,11 @@ bridge.on_disconnect = function()
     end
   end
   
-  -- Clear Pragtical TreeView sidebar cache to force a local reload
-  local treeview_plugin = package.loaded["plugins.treeview"]
-  if treeview_plugin then
-    treeview_plugin.cache = {}
-  end
-  
+  -- Clear the TreeView sidebar cache and drop remote-path watch/expand
+  -- state so stale remote directories are not re-watched or re-expanded
+  -- locally after disconnecting.
+  clear_treeview_remote_state()
+
   core.redraw = true
 end
 
@@ -149,6 +155,56 @@ local function invalidate_cache(path)
   end
 end
 
+-- Clears the TreeView sidebar cache so the next draw re-queries the
+-- filesystem. The treeview module IS the view instance (treeview.lua
+-- creates `local view = TreeView()` and returns it), so the cache lives
+-- directly on package.loaded["plugins.treeview"]. Deliberately does NOT
+-- touch view.expanded/watches: this runs on every refresh (new-file,
+-- remote:refresh, terminal focus changes), and dropping expanded state
+-- there would collapse every open directory (and nil-ing watches entries
+-- while the treeview's own DirWatch thread iterates the same table is
+-- undefined behavior).
+function clear_treeview_cache()
+  local tv = package.loaded["plugins.treeview"]
+  if tv and tv.cache then tv.cache = {} end
+end
+
+-- Disconnect-time TreeView cleanup: in addition to the cache, drop the
+-- DirWatch and expanded entries for remote workspace paths so stale remote
+-- directories are not re-watched or re-expanded locally. Called once per
+-- disconnect -- not from the periodic refresh paths.
+function clear_treeview_remote_state()
+  local tv = package.loaded["plugins.treeview"]
+  if not tv then return end
+  clear_treeview_cache()
+  local remote_paths = get_normalized_project_paths()
+  if next(remote_paths) == nil then return end
+  if tv.watches then
+    -- collect first, then remove: modifying a table during pairs()
+    -- iteration is undefined behavior in Lua
+    local to_remove = {}
+    for project in pairs(tv.watches) do
+      for _, proj_path in ipairs(remote_paths) do
+        if project and project.path == proj_path then
+          to_remove[project] = true
+        end
+      end
+    end
+    for project in pairs(to_remove) do
+      tv.watches[project] = nil
+    end
+  end
+  if tv.expanded then
+    for path in pairs(tv.expanded) do
+      for _, proj_path in ipairs(remote_paths) do
+        if type(path) == "string" and path:sub(1, #proj_path) == proj_path then
+          tv.expanded[path] = nil
+        end
+      end
+    end
+  end
+end
+
 -- Clears every remote filesystem cache and the TreeView sidebar cache so the
 -- next access re-queries the remote host. Used after remote mutations (new
 -- file creation) and by the `remote:refresh` command so the sidebar reflects
@@ -156,10 +212,7 @@ end
 local function refresh_remote()
   list_dir_cache = {}
   file_info_cache = {}
-  local treeview_plugin = package.loaded["plugins.treeview"]
-  if treeview_plugin then
-    treeview_plugin.cache = {}
-  end
+  clear_treeview_cache()
   core.redraw = true
 end
 
@@ -694,10 +747,7 @@ command.add(nil, {
             if bridge.remote_cwd then
               save_recent_path(ssh_host, bridge.remote_cwd)
             end
-            local treeview_plugin = package.loaded["plugins.treeview"]
-            if treeview_plugin then
-              treeview_plugin.cache = {}
-            end
+            clear_treeview_cache()
             core.redraw = true
           end
         end
@@ -751,10 +801,8 @@ command.add(nil, {
           list_dir_cache = {}
           file_info_cache = {}
 
-          local treeview_plugin = package.loaded["plugins.treeview"]
-          if treeview_plugin then
-            treeview_plugin.cache = {}
-          end
+          clear_treeview_cache()
+
 
           core.redraw = true
         else
@@ -945,3 +993,11 @@ core.add_thread(function()
     end
   end
 end)
+
+-- Explicit module return: without this, require() falls back to `true`
+-- (the chunk returns no value), so nothing outside can reach the helpers.
+return {
+  clear_treeview_cache = clear_treeview_cache,
+  clear_treeview_remote_state = clear_treeview_remote_state,
+  refresh_remote = refresh_remote,
+}
