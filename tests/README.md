@@ -34,6 +34,11 @@ background coroutine, prints results, and quits with exit code `0` on success
 | `benchmarks.lua` | standalone benchmarks for `bridge.lua` efficiency; run      |
 |                  | explicitly for before/after numbers (~0.5 s, does not       |
 |                  | meaningfully slow the suite when picked up by `tests/`).    |
+| `server_e2e_bench.lua` | E2E benchmarks against the compiled headless server.  |
+|                  | NOT run directly — use `./bench-server.sh` from the repo    |
+|                  | root (launches the server in a scratch dir, measures real   |
+|                  | round-trip latencies over loopback TCP). Skips itself when  |
+|                  | picked up by `tests/` without the harness environment.      |
 
 ## Notes
 

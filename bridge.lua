@@ -145,23 +145,17 @@ local function process_socket_stream(chunk)
 end
 
 -- Encodes and transmits a command with a 4-byte network byte-order header.
--- Header and payload are written separately to avoid copying the whole
--- payload a second time on large saves (TCP is a byte stream, so the
--- framing state machine reassembles both orders identically).
+-- Header and payload are concatenated into one write: splitting them makes
+-- the second write wait for the receiver's delayed ACK of the first
+-- (Nagle on the client side), adding ~40 ms per request/response
+-- round-trip. Benchmark-verified (see tests/server_e2e_bench.lua).
 local function send_remote_command(payload_table)
   if not bridge.client_socket then return false end
   local bin_data = mp.pack(payload_table)
   local length = #bin_data
   local header = string.pack(">I4", length)
 
-  local written, err = bridge.client_socket:write(header)
-  if not written then
-    core.error("[%s] Socket write error: %s", bridge.current_ssh_host or "Remote", tostring(err))
-    bridge.disconnect()
-    return false
-  end
-
-  written, err = bridge.client_socket:write(bin_data)
+  local written, err = bridge.client_socket:write(header .. bin_data)
   if not written then
     core.error("[%s] Socket write error: %s", bridge.current_ssh_host or "Remote", tostring(err))
     bridge.disconnect()

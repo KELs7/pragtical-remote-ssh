@@ -4,6 +4,15 @@
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
+-- Resolve the plugin root so relative dofiles resolve even when the
+-- caller's cwd is not the plugin root (e.g. bench-server.sh runs from a
+-- scratch dir). debug.getinfo(1, "S").source is "@<path>" for dofile'd
+-- files; helper.inc lives in <root>/tests.
+local here = debug.getinfo(1, "S").source:match("^@(.*)/[^/]*$") or "."
+-- strip the trailing tests component (handles both "/path/tests" and the
+-- cwd-relative "tests" the test runner produces)
+local root = here:gsub("/tests$", ""):gsub("^tests$", ".")
+
 local H = {}
 
 -- Remap the plugin's internal require paths to dofile so the plugin sources
@@ -18,7 +27,7 @@ package.preload["plugins.remote-ssh.messagepack"] = function()
   return dofile("messagepack.lua")
 end
 
-H.mp = require("plugins.remote-ssh.messagepack")
+H.mp = dofile(root .. "/messagepack.lua")
 
 -- Unique temp path helper (mirrors the assistant plugin convention).
 local temp_counter = 0
