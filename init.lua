@@ -529,6 +529,30 @@ io.open = function(filename, mode)
   return original_io_open(filename, mode)
 end
 
+-- When a terminal that was spawned with a LOCAL shell (toggled on before
+-- connecting) is shown or focused after a remote session is active, inject an
+-- SSH command so it becomes a remote terminal. Pragtical reuses a single
+-- core.terminal_view across toggles, so TerminalView:spawn (and the override
+-- above) only runs on first creation -- a pre-connect local terminal never
+-- re-spawns, so without this promotion toggling it on post-connect just
+-- re-shows the local shell. Uses `exec ssh` on non-Windows so the local
+-- shell is replaced; when ssh later exits, TerminalView:update detects the
+-- exited pty and auto-closes the view, so the next toggle spawns a fresh
+-- terminal through the spawn override. Guarded by is_remote_terminal so it
+-- fires at most once per view. Duck-typed (view.terminal + view.input) to
+-- avoid needing the lazily-loaded TerminalView class reference here.
+local function promote_terminal_to_remote(view)
+  if not (view and view.terminal and view.input) then return end
+  if view.is_remote_terminal then return end
+  if not bridge.is_connected() or not bridge.current_ssh_host then return end
+  view.is_remote_terminal = true
+  local newline = (view.options and view.options.newline) or "\r"
+  local remote_cmd = string.format("cd %q && exec ${SHELL:-sh} -l", bridge.remote_cwd or ".")
+  local prefix = (PLATFORM:lower() == "windows") and "" or "exec "
+  local ssh_cmd = string.format("%sssh -t %s %q%s", prefix, bridge.current_ssh_host, remote_cmd, newline)
+  pcall(view.input, view, ssh_cmd)
+end
+
 -- Refresh the sidebar when focus leaves a remote terminal view. Files created
 -- inside the SSH terminal (e.g. `touch new.txt`) would otherwise stay hidden
 -- behind the list_dir TTL cache until it expires, since DirWatch polling is
@@ -541,6 +565,7 @@ function core.set_active_view(view)
   if bridge.is_connected() and prev and prev ~= view and prev.is_remote_terminal then
     refresh_remote()
   end
+  promote_terminal_to_remote(view)
 end
 
 -- Extend Pragtical's update loop
@@ -578,18 +603,28 @@ end
 -- TREEVIEW INTERFACE CUSTOMIZATIONS
 -- =====================================================================
 
+-- treeview loads lazily in some setups; poll until it is available,
+-- then install the override once (idempotent guard) and stop polling.
+local function install_treeview_override(treeview)
+  treeview._remote_ssh_wrapped = true
+  local original_get_item_text = treeview.get_item_text
+  function treeview:get_item_text(item, active, hovered)
+    if bridge.is_connected() and item.abs_filename == item.project.path then
+      local font = style.font
+      local color = (active or hovered) and style.accent or style.text
+      return "[" .. (bridge.current_ssh_host or "Remote") .. "]", font, color
+    end
+    return original_get_item_text(self, item, active, hovered)
+  end
+end
+
 core.add_thread(function()
-  coroutine.yield(0.2)
-  local treeview = package.loaded["plugins.treeview"]
-  if treeview then
-    local original_get_item_text = treeview.get_item_text
-    function treeview:get_item_text(item, active, hovered)
-      if bridge.is_connected() and item.abs_filename == item.project.path then
-        local font = style.font
-        local color = (active or hovered) and style.accent or style.text
-        return "[" .. (bridge.current_ssh_host or "Remote") .. "]", font, color
-      end
-      return original_get_item_text(self, item, active, hovered)
+  while true do
+    coroutine.yield(0.2)
+    local treeview = package.loaded["plugins.treeview"]
+    if treeview and not treeview._remote_ssh_wrapped then
+      install_treeview_override(treeview)
+      return
     end
   end
 end)
@@ -673,53 +708,88 @@ end
 -- TERMINAL INTERFACE CUSTOMIZATIONS (SSH AUTO-ROUTING)
 -- =====================================================================
 
-core.add_thread(function()
-  coroutine.yield(0.2)
-  local terminal_plugin = package.loaded["plugins.terminal"]
-  if terminal_plugin and terminal_plugin.class then
-    local TerminalView = terminal_plugin.class
-    
-    local original_spawn = TerminalView.spawn
-    function TerminalView:spawn()
-      if bridge.is_connected() and bridge.current_ssh_host then
-        self.is_remote_terminal = true
-        local is_windows = (PLATFORM:lower() == "windows")
-        if is_windows then
-          core.add_thread(function()
-            for i = 1, 10 do
-              if self.terminal then break end
-              coroutine.yield(0.05)
-            end
-            if self.terminal then
-              local newline = self.options.newline or "\r\n"
-              local remote_cmd = string.format("cd %q && exec ${SHELL:-sh} -l", bridge.remote_cwd or ".")
-              local ssh_cmd = string.format("ssh -t %s %q%s", bridge.current_ssh_host, remote_cmd, newline)
-              self:input(ssh_cmd)
-            end
-          end)
-        else
-          self.options.shell = "ssh"
-          self.options.arguments = {
-            "-t",
-            bridge.current_ssh_host,
-            string.format("cd %q && exec ${SHELL:-sh} -l", bridge.remote_cwd or ".")
-          }
-        end
+-- The terminal plugin loads lazily (on first toggle), which may be long
+-- after this plugin loads at startup. A one-shot 0.2 s deferred install
+-- would miss it and leave TerminalView:spawn unwrapped, so toggling the
+-- terminal on after connecting spawned a *local* shell instead of an SSH
+-- session (the override was never installed). Poll until the terminal
+-- plugin is loaded, then install the override once (idempotent guard) and
+-- stop polling.
+local sync_remote_terminals_cwd  -- forward declaration; defined below
+local function install_terminal_override(TerminalView)
+  TerminalView._remote_ssh_wrapped = true
+
+  local original_spawn = TerminalView.spawn
+  function TerminalView:spawn()
+    if bridge.is_connected() and bridge.current_ssh_host then
+      self.is_remote_terminal = true
+      local is_windows = (PLATFORM:lower() == "windows")
+      if is_windows then
+        core.add_thread(function()
+          for i = 1, 10 do
+            if self.terminal then break end
+            coroutine.yield(0.05)
+          end
+          if self.terminal then
+            local newline = self.options.newline or "\r\n"
+            local remote_cmd = string.format("cd %q && exec ${SHELL:-sh} -l", bridge.remote_cwd or ".")
+            local ssh_cmd = string.format("ssh -t %s %q%s", bridge.current_ssh_host, remote_cmd, newline)
+            self:input(ssh_cmd)
+          end
+        end)
+      else
+        self.options.shell = "ssh"
+        self.options.arguments = {
+          "-t",
+          bridge.current_ssh_host,
+          string.format("cd %q && exec ${SHELL:-sh} -l", bridge.remote_cwd or ".")
+        }
       end
-      
-      original_spawn(self)
     end
 
-    local original_get_name = TerminalView.get_name
-    function TerminalView:get_name()
-      local name = original_get_name(self)
-      if bridge.is_connected() and bridge.current_ssh_host then
-        return "[" .. bridge.current_ssh_host .. "] " .. name
-      end
-      return name
+    original_spawn(self)
+  end
+
+  local original_get_name = TerminalView.get_name
+  function TerminalView:get_name()
+    local name = original_get_name(self)
+    if bridge.is_connected() and bridge.current_ssh_host then
+      return "[" .. bridge.current_ssh_host .. "] " .. name
+    end
+    return name
+  end
+end
+
+core.add_thread(function()
+  while true do
+    coroutine.yield(0.2)
+    local terminal_plugin = package.loaded["plugins.terminal"]
+    local TerminalView = terminal_plugin and terminal_plugin.class
+    if TerminalView and not TerminalView._remote_ssh_wrapped then
+      install_terminal_override(TerminalView)
+      return
     end
   end
 end)
+
+-- Send `cd <cwd>` to every active remote terminal so its SSH shell follows
+-- a remote:change-directory. New terminals pick up bridge.remote_cwd via the
+-- spawn override above; this covers terminals already open. Quoting uses
+-- Lua %q (same style as the spawn override) which is shell-compatible. pcall
+-- guards against a terminal in a half-initialized state.
+function sync_remote_terminals_cwd()
+  if not bridge.is_connected() or not bridge.remote_cwd then return end
+  local terminal_plugin = package.loaded["plugins.terminal"]
+  local TerminalView = terminal_plugin and terminal_plugin.class
+  if not TerminalView then return end
+  local views = core.root_view.root_node:get_children()
+  for _, v in ipairs(views) do
+    if v.is_remote_terminal and v.terminal and v.input then
+      local nl = (v.options and v.options.newline) or "\r"
+      pcall(v.input, v, string.format("cd %q%s", bridge.remote_cwd, nl))
+    end
+  end
+end
 
 
 -- =====================================================================
@@ -803,6 +873,7 @@ command.add(nil, {
 
           clear_treeview_cache()
 
+          sync_remote_terminals_cwd()
 
           core.redraw = true
         else
