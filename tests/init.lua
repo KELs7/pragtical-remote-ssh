@@ -39,6 +39,9 @@ core.add_thread = function(fn, ...)
 end
 
 -- Load the plugin sources from the repo root (via package.preload).
+-- NOTE: this file must load BEFORE any other test file that requires the
+-- module (its deferred treeview/terminal hooks are captured here and
+-- resumed on OUR fakes). The regression file is named zz_* to sort last.
 local remote_ssh = require "plugins.remote-ssh"
 
 -- Restore add_thread for the rest of the runtime; the plugin's two
