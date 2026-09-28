@@ -146,6 +146,47 @@ local function disconnect()
   core.projects = {}
 end
 
+-- A fake terminal VIEW (an instance, not the class). The plugin's
+-- promote_terminal_to_remote / sync_remote_terminals_cwd duck-type a
+-- terminal via `view.terminal and view.input`, so the fake needs a live
+-- `terminal` token, a recording `:input` method, and the two methods the
+-- real core.set_active_view calls on the new view (supports_text_input,
+-- extends). `opts.remote` pre-sets is_remote_terminal; `opts.terminal`
+-- overrides the live-terminal token (pass false to simulate a dead pty --
+-- nil is the "use default" sentinel, not "no terminal").
+local function make_term_view(opts)
+  opts = opts or {}
+  local v = {
+    terminal = (opts.terminal == nil) and true or opts.terminal,
+    options = { newline = "\r" },
+    inputs = {},
+    supports_text_input = function() return true end,
+    extends = function() return false end,
+  }
+  if opts.remote then v.is_remote_terminal = true end
+  function v:input(text) table.insert(self.inputs, text) end
+  return v
+end
+
+-- Locate the deferred terminal-polling install thread among the load-time
+-- captured core.add_thread fns. The polling fn reads
+-- package.loaded["plugins.terminal"] each iteration, so probing with a
+-- throwaway fresh (un-wrapped) class identifies it: it installs on the
+-- probe and sets _remote_ssh_wrapped. The probe is discarded; package.loaded
+-- is restored afterwards.
+local function find_terminal_poll_fn()
+  for _, fn in ipairs(captured_threads) do
+    local probe = { class = { spawn = function() end, get_name = function() return "t" end } }
+    local saved = package.loaded["plugins.terminal"]
+    package.loaded["plugins.terminal"] = probe
+    local co = coroutine.create(fn)
+    coroutine.resume(co)  -- advances to coroutine.yield(0.2)
+    coroutine.resume(co)  -- checks; installs on the probe if it is the terminal fn
+    package.loaded["plugins.terminal"] = saved
+    if probe.class._remote_ssh_wrapped then return fn end
+  end
+end
+
 -- -----------------------------------------------------------------------
 -- Tests
 -- -----------------------------------------------------------------------
@@ -512,6 +553,27 @@ test.describe("remote-ssh init", function()
         test.equal(#errors >= 1, true)
         test.match(errors[1], "no such dir")
       end)
+
+      test.it("sends cd to existing remote terminals on submit", function()
+        local remote_term = make_term_view({ remote = true })
+        local local_term = make_term_view()  -- not remote yet
+        local dead_term = make_term_view({ remote = true, terminal = false })
+        local node = core.root_view.root_node
+        local restore = H.swap(node, "get_children",
+          function() return { remote_term, local_term, dead_term } end)
+        command.perform("remote:change-directory")
+        clear_spies()
+        captured.submit("/new/dir")
+        restore()
+        test.equal(bridge.remote_cwd, "/new/dir")
+        -- existing remote terminal received a `cd <cwd>` input
+        test.equal(#remote_term.inputs, 1)
+        test.match(remote_term.inputs[1], 'cd "/new/dir"')
+        -- non-remote terminal was skipped
+        test.equal(#local_term.inputs, 0)
+        -- terminal without a live pty was skipped
+        test.equal(#dead_term.inputs, 0)
+      end)
     end)
 
     test.describe("remote:new-file", function()
@@ -585,6 +647,101 @@ test.describe("remote-ssh init", function()
     test.it("prefixes terminal names with the host", function()
       local name = fake_terminal.class.get_name({ is_remote_terminal = true })
       test.match(name, "%[myhost%]")
+    end)
+  end)
+
+  test.describe("terminal override lazy-load install (polling)", function()
+    -- The terminal plugin loads lazily (on first toggle). The install
+    -- thread polls package.loaded["plugins.terminal"] until it appears,
+    -- then installs the spawn/get_name override once (idempotent guard).
+    local fn
+    test.before_each(function() fn = find_terminal_poll_fn() end)
+
+    test.it("finds the polling thread among captured add_thread fns", function()
+      test.not_nil(fn)
+    end)
+
+    test.it("does not install while the terminal plugin is not loaded", function()
+      test.not_nil(fn)
+      local saved = package.loaded["plugins.terminal"]
+      package.loaded["plugins.terminal"] = nil  -- simulate not-yet-loaded
+      local co = coroutine.create(fn)
+      coroutine.resume(co)  -- yield(0.2)
+      coroutine.resume(co)  -- check (absent) -> loop -> yield
+      test.equal(fake_terminal.class._remote_ssh_wrapped, true)  -- unchanged from load
+      package.loaded["plugins.terminal"] = saved
+    end)
+
+    test.it("installs the override once the terminal plugin loads later", function()
+      test.not_nil(fn)
+      local fresh = { class = { spawn = function() end, get_name = function() return "t" end } }
+      local saved = package.loaded["plugins.terminal"]
+      package.loaded["plugins.terminal"] = nil
+      local co = coroutine.create(fn)
+      coroutine.resume(co)  -- yield
+      coroutine.resume(co)  -- absent -> loop -> yield
+      test.is_nil(fresh.class._remote_ssh_wrapped)
+      package.loaded["plugins.terminal"] = fresh  -- plugin loads now
+      coroutine.resume(co)  -- present + not wrapped -> install -> return
+      test.equal(fresh.class._remote_ssh_wrapped, true)
+      test.equal(type(fresh.class.spawn), "function")
+      test.equal(type(fresh.class.get_name), "function")
+      package.loaded["plugins.terminal"] = saved
+    end)
+
+    test.it("is idempotent: does not re-install an already-wrapped class", function()
+      test.not_nil(fn)
+      -- fake_terminal.class was wrapped once at load; the polling loop must
+      -- skip it (guard `not _remote_ssh_wrapped`) and not re-wrap spawn.
+      test.equal(fake_terminal.class._remote_ssh_wrapped, true)
+      local before_spawn = fake_terminal.class.spawn
+      local co = coroutine.create(fn)
+      coroutine.resume(co)  -- yield
+      coroutine.resume(co)  -- present but wrapped -> skip -> return
+      test.equal(fake_terminal.class.spawn, before_spawn)
+    end)
+  end)
+
+  test.describe("promote_terminal_to_remote (pre-connect local terminal)", function()
+    -- When a local-shell terminal (created before connecting) is shown/focused
+    -- after a remote session is active, the core.set_active_view hook injects
+    -- `exec ssh -t <host> "cd <cwd> && exec ${SHELL:-sh} -l"` into it so it
+    -- becomes a remote terminal. Pragtical reuses one core.terminal_view across
+    -- toggles, so :spawn (and its override) never re-runs for it -- this
+    -- promotion is the only path that converts an existing local terminal.
+    local saved_active_view
+    test.before_each(function() saved_active_view = core.active_view end)
+    test.after_each(function() core.active_view = saved_active_view end)
+
+    test.it("injects exec ssh into a local-shell terminal shown after connect", function()
+      local view = make_term_view()
+      core.set_active_view(view)
+      test.equal(view.is_remote_terminal, true)
+      test.equal(#view.inputs, 1)
+      test.match(view.inputs[1], "exec ssh %-t myhost")
+      test.match(view.inputs[1], "/remote/home")
+      test.match(view.inputs[1], "exec %$%{SHELL")
+    end)
+
+    test.it("is a no-op when the view is already a remote terminal", function()
+      local view = make_term_view({ remote = true })
+      core.set_active_view(view)
+      test.equal(#view.inputs, 0)
+    end)
+
+    test.it("is a no-op when the view has no live terminal", function()
+      local view = make_term_view({ terminal = false })
+      core.set_active_view(view)
+      test.equal(view.is_remote_terminal, nil)
+      test.equal(#view.inputs, 0)
+    end)
+
+    test.it("is a no-op when disconnected", function()
+      bridge.disconnect()
+      local view = make_term_view()
+      test.no_error(function() core.set_active_view(view) end)
+      test.equal(view.is_remote_terminal, nil)
+      test.equal(#view.inputs, 0)
     end)
   end)
 
