@@ -155,11 +155,29 @@ local function send_remote_command(payload_table)
   local length = #bin_data
   local header = string.pack(">I4", length)
 
-  local written, err = bridge.client_socket:write(header .. bin_data)
-  if not written then
-    core.error("[%s] Socket write error: %s", bridge.current_ssh_host or "Remote", tostring(err))
-    bridge.disconnect()
-    return false
+  -- Single concatenated write: splitting header and payload makes the
+  -- second write wait for the receiver's delayed ACK of the first (Nagle
+  -- on the client side), adding ~40 ms per request/response round-trip
+  -- (benchmark-verified, LESSONS §35). Drain in a loop: net.tcp:write may
+  -- deliver only part of the data, or return 0 when the send buffer is
+  -- full; a single best-effort write would silently drop the remainder,
+  -- truncating large save_file frames and hanging the server until the
+  -- 10 s timeout. Note 0 (not ready) is truthy in Lua, so the old
+  -- `if not written` guard treated it as success.
+  local packet = header .. bin_data
+  local sent = 0
+  while sent < #packet do
+    local n, err = bridge.client_socket:write(packet:sub(sent + 1))
+    if not n then
+      core.error("[%s] Socket write error: %s", bridge.current_ssh_host or "Remote", tostring(err))
+      bridge.disconnect()
+      return false
+    end
+    if n == 0 then
+      system.sleep(0.001)
+    else
+      sent = sent + n
+    end
   end
   return true
 end
@@ -214,33 +232,34 @@ function bridge.perform_sync_request(request)
   local timeout = 10.0
   
   while not pending_responses[request_id] do
-    if bridge.client_socket:get_status() ~= "success" then
-      core.error("[%s Sync] Socket disconnected.", bridge.current_ssh_host or "Remote")
-      bridge.disconnect()
-      break
-    end
-
-    local chunk, err = bridge.client_socket:read(4096)
+    local chunk, err = bridge.client_socket:read(65536)
     if err then
       core.log("[%s] Connection lost: %s", bridge.current_ssh_host or "Remote", tostring(err))
       bridge.disconnect()
       break
     end
-    
+
     if chunk and chunk ~= "" then
       process_socket_stream(chunk)
-    end
-
-    if not pending_responses[request_id] then
-      if system.get_time() - start_time > timeout then
-        core.error("[%s Sync] Request timed out for action: %s", bridge.current_ssh_host or "Remote", tostring(request.action))
+    else
+      -- No data this poll: check liveness here rather than every
+      -- iteration, so a large multi-chunk response isn't charged a
+      -- get_status call per chunk. read() returning nil+err already
+      -- catches a disconnect, so this status check is belt-and-suspenders.
+      if bridge.client_socket:get_status() ~= "success" then
+        core.error("[%s Sync] Socket disconnected.", bridge.current_ssh_host or "Remote")
+        bridge.disconnect()
         break
       end
       -- Only sleep when no data arrived; sleeping while chunks are still
       -- streaming adds ~1 ms per read (over a second on a multi-MB file).
-      if not chunk or chunk == "" then
-        system.sleep(0.001)
-      end
+      system.sleep(0.001)
+    end
+
+    if not pending_responses[request_id]
+      and system.get_time() - start_time > timeout then
+      core.error("[%s Sync] Request timed out for action: %s", bridge.current_ssh_host or "Remote", tostring(request.action))
+      break
     end
   end
   
@@ -467,8 +486,10 @@ function bridge.update()
     end
   end
 
-  -- Standard socket read
-  local chunk, err = bridge.client_socket:read(4096)
+  -- Standard socket read. Larger buffer (64 KB) cuts syscall count on
+  -- bursts of async events; returns only what is available, so idle frames
+  -- cost the same as the old 4 KB read.
+  local chunk, err = bridge.client_socket:read(65536)
   if err then
     core.error("Read error: " .. tostring(err))
     bridge.disconnect()
