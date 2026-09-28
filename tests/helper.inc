@@ -226,4 +226,106 @@ function H.swap(t, k, v)
   return function() t[k] = old end
 end
 
+-- Launch the compiled headless server on a free port over real loopback TCP
+-- and wire a real net.tcp socket to it. Returns a table { sock, proc,
+-- workdir, port, teardown } or nil + errmsg (binary missing, server didn't
+-- start, connect failed). This is the only seam that exercises real framing,
+-- Nagle, real read-buffer semantics, and real disconnect detection -- fake
+-- sockets cannot (LESSONS §35). The server resolves relative paths against
+-- its own CWD (= workdir), so we chdir into a scratch dir before launch
+-- (LESSONS §19/§26). teardown closes the socket, terminates the proc, waits
+-- for it to die, and removes the scratch dir.
+local real_server_port_counter = 9089
+function H.real_server(opts)
+  opts = opts or {}
+  local process = rawget(_G, "process")
+  local net = rawget(_G, "net")
+  if not (process and net) then
+    return nil, "net or process module unavailable"
+  end
+  local repo = opts.repo or system.getcwd()
+  local binary = opts.binary or
+    (repo .. "/built-binaries/ubuntu-24/x86_64/headless-server")
+  local f = io.open(binary, "r")
+  if not f then return nil, "binary not found: " .. binary end
+  f:close()
+
+  real_server_port_counter = real_server_port_counter + 1
+  local port = opts.port or real_server_port_counter
+  local workdir = os.tmpname()
+  os.remove(workdir)
+  os.execute("mkdir -p " .. workdir)
+
+  local cur = system.getcwd()
+  local proc
+  local ok_launch = pcall(function()
+    system.chdir(workdir)
+    proc = process.start({ binary, tostring(port) }, {
+      stdin = process.REDIRECT_DISCARD,
+      stdout = process.REDIRECT_PIPE,
+      stderr = process.REDIRECT_PIPE,
+    })
+  end)
+  system.chdir(cur)
+  if not (ok_launch and proc) then
+    os.execute("rm -rf " .. workdir)
+    return nil, "failed to start server process"
+  end
+
+  -- Wait for the "running on port" banner on stdout.
+  local buf, ready = "", false
+  local t0 = system.get_time()
+  while system.get_time() - t0 < 5 do
+    if not proc:running() then break end
+    local out = proc:read_stdout(4096)
+    if out and out ~= "" then buf = buf .. out end
+    if buf:find("running on port") then ready = true break end
+    system.sleep(0.01)
+  end
+  if not ready then
+    pcall(proc.terminate, proc)
+    os.execute("rm -rf " .. workdir)
+    return nil, "server did not signal ready: " .. (buf:gsub("%s", " "))
+  end
+
+  -- Blocking resolve (LESSONS §25: 0-timeout polls never resolve outside the
+  -- main loop; the blocking form does).
+  local addr = net.resolve_address("127.0.0.1")
+  addr:wait_until_resolved(1)
+  local sock
+  for _ = 1, 100 do
+    sock = net.open_tcp(addr, port)
+    if sock then
+      for _ = 1, 100 do
+        if sock:wait_until_connected(0) == "success" then break end
+      end
+      if sock:get_status() == "success" then break end
+      pcall(sock.close, sock)
+      sock = nil
+    end
+    system.sleep(0.01)
+  end
+  if not sock then
+    pcall(proc.terminate, proc)
+    os.execute("rm -rf " .. workdir)
+    return nil, "failed to connect to server on port " .. port
+  end
+
+  return {
+    sock = sock,
+    proc = proc,
+    workdir = workdir,
+    port = port,
+    teardown = function()
+      pcall(sock.close, sock)
+      pcall(proc.terminate, proc)
+      local t1 = system.get_time()
+      while proc:running() and system.get_time() - t1 < 2 do
+        system.sleep(0.01)
+      end
+      os.execute("rm -rf " .. workdir)
+    end,
+  }
+end
+
 return H
