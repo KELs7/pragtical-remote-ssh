@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# remote-plugin v0.7.2
+# remote-plugin v0.7.3
 
 # Exit immediately if any compilation step fails
 set -e
