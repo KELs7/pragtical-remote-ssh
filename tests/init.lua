@@ -446,6 +446,21 @@ test.describe("remote-ssh init", function()
     end)
 
     test.describe("remote:connect-ssh", function()
+      -- remote:connect-ssh wraps bridge.connect in core.add_thread so the
+      -- editor stays responsive during the (cooperative) connect waits.
+      -- The scheduler does not tick inside a test coroutine, so capture the
+      -- thread fn and resume it manually to drive the mocked connect +
+      -- post-connect UI work (LESSONS §8).
+      local function run_connect_thread(input)
+        local thread_fn
+        local restore_at = H.swap(core, "add_thread",
+          function(fn) thread_fn = fn end)
+        captured.submit(input)
+        restore_at()
+        test.not_nil(thread_fn)
+        coroutine.resume(coroutine.create(thread_fn))
+      end
+
       test.it("parses host:path input and connects", function()
         local called
         local restore = H.swap(bridge, "connect", function(host, path)
@@ -454,7 +469,7 @@ test.describe("remote-ssh init", function()
           return true
         end)
         command.perform("remote:connect-ssh")
-        captured.submit("myhost:/srv")
+        run_connect_thread("myhost:/srv")
         restore()
         test.equal(called.host, "myhost")
         test.equal(called.path, "/srv")
@@ -467,7 +482,7 @@ test.describe("remote-ssh init", function()
           return true
         end)
         command.perform("remote:connect-ssh")
-        captured.submit("myhost")
+        run_connect_thread("myhost")
         restore()
         test.equal(called.host, "myhost")
         test.is_nil(called.path)
@@ -478,7 +493,7 @@ test.describe("remote-ssh init", function()
           return true
         end)
         command.perform("remote:connect-ssh")
-        captured.submit("myhost:/srv")
+        run_connect_thread("myhost:/srv")
         restore()
         local f = io.open(recents_file(), "r")
         test.not_nil(f)

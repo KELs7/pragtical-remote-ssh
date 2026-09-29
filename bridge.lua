@@ -30,6 +30,26 @@ local pending_responses = {}
 local async_event_queue = {}
 local last_stderr_check = 0
 
+-- Cooperative sleep for bridge.connect's SSH-tunnel / resolve /
+-- connect-retry loops. Yields to the main-loop scheduler when running inside
+-- a coroutine (so the editor redraws and stays responsive during the
+-- multi-second connect waits -- core.add_thread / core.add_background_thread
+-- are both coroutines resumed by the main loop, NOT OS threads; system.sleep
+-- is SDL_Delay and blocks the whole main thread, freezing the UI).
+-- coroutine.yield(seconds) returns control to the scheduler, which redraws
+-- between resumes. Falls back to system.sleep for synchronous callers.
+-- NOT used by perform_sync_request / send_remote_command: those run from
+-- synchronous callers (Doc:load, redraw intercepts) and from test
+-- coroutines where yielding mid-request would interleave redraws with
+-- incomplete state; their waits are also brief (loopback, sub-ms).
+local function coop_sleep(seconds)
+  if coroutine.isyieldable() then
+    coroutine.yield(seconds)
+  else
+    system.sleep(seconds)
+  end
+end
+
 -- Helper to safely terminate background processes
 local function stop_process(proc)
   if not proc then return end
@@ -52,7 +72,7 @@ local function check_ssh_agent()
       stop_process(proc)
       return 2
     end
-    system.sleep(0.005)
+    coop_sleep(0.005)
   end
   local code = proc:returncode()
   return code or 2
@@ -253,6 +273,11 @@ function bridge.perform_sync_request(request)
       end
       -- Only sleep when no data arrived; sleeping while chunks are still
       -- streaming adds ~1 ms per read (over a second on a multi-MB file).
+      -- system.sleep (not coop_sleep): perform_sync_request runs from
+      -- synchronous callers (Doc:load, redraw intercepts) where yielding
+      -- is not possible, and from test coroutines where yielding mid-request
+      -- would interleave redraws with incomplete state. The connect-time
+      -- round-trips are brief (loopback, sub-ms), so blocking is negligible.
       system.sleep(0.001)
     end
 
@@ -348,7 +373,7 @@ function bridge.connect(ssh_host, target_dir)
         break
       end
     end
-    system.sleep(0.01)
+    coop_sleep(0.01)
   end
 
   if not ready then
@@ -375,7 +400,7 @@ function bridge.connect(ssh_host, target_dir)
     elseif status == "failure" then
       break
     end
-    system.sleep(0.01)
+    coop_sleep(0.01)
   end
 
   if not resolved then
@@ -406,13 +431,13 @@ function bridge.connect(ssh_host, target_dir)
         elseif status == "failure" then
           break
         end
-        system.sleep(0.01)
+        coop_sleep(0.01)
       end
     end
 
     if not connected then
       if sock then sock:close() end
-      system.sleep(0.25)
+      coop_sleep(0.25)
     end
   end
 

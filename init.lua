@@ -812,14 +812,23 @@ command.add(nil, {
             target_path = nil
           end
 
-          local success = bridge.connect(ssh_host, target_path)
-          if success then
-            if bridge.remote_cwd then
-              save_recent_path(ssh_host, bridge.remote_cwd)
+          -- Run connect in a background coroutine so the editor stays
+          -- responsive during the SSH handshake / resolve / connect-retry
+          -- loops (bridge.connect's waits use coop_sleep, which yields to
+          -- the scheduler instead of blocking on SDL_Delay). The command
+          -- returns immediately; post-connect UI work runs after success.
+          core.add_thread(function()
+            local success = bridge.connect(ssh_host, target_path)
+            if success then
+              if bridge.remote_cwd then
+                save_recent_path(ssh_host, bridge.remote_cwd)
+              end
+              clear_treeview_cache()
+              core.redraw = true
+            else
+              core.error("Failed to connect to %s", tostring(ssh_host))
             end
-            clear_treeview_cache()
-            core.redraw = true
-          end
+          end)
         end
       end,
       suggest = function(text)
